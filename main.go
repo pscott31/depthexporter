@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/csv"
 	"fmt"
-	"log"
 	"os"
 	"sort"
 	"strconv"
@@ -15,18 +14,19 @@ import (
 	"code.vegaprotocol.io/vega/logging"
 	"code.vegaprotocol.io/vega/paths"
 	"github.com/georgysavva/scany/pgxscan"
+	"github.com/holiman/uint256"
 	"github.com/jackc/pgx/v4"
-	"github.com/shopspring/decimal"
 	"golang.org/x/exp/maps"
 )
 
-var BUCKET_MINUTES = 1
+var BUCKET_MINUTES = 5
 
 type Order struct {
 	ID          entities.OrderID
 	MarketID    entities.MarketID
+	PartyID     entities.PartyID
 	Side        entities.Side
-	Price       decimal.Decimal
+	Price       uint256.Int
 	Remaining   int64
 	TimeInForce entities.OrderTimeInForce
 	Type        entities.OrderType
@@ -34,26 +34,74 @@ type Order struct {
 }
 
 func (o Order) isLive() bool {
-	if o.Status != entities.OrderStatusActive && o.Status != entities.OrderStatusParked {
-		return false
-	}
-	if o.Type != entities.OrderTypeLimit {
-		return false
-	}
-	if o.TimeInForce == entities.OrderTimeInForceIOC || o.TimeInForce == entities.OrderTimeInForceFOK {
-		return false
-	}
-	return true
+	return o.Status == entities.OrderStatusActive
 }
 
 type Level struct {
-	price decimal.Decimal
+	price uint256.Int
 	side  entities.Side
+}
+
+func writeDepth(end time.Time, depth map[entities.MarketID]map[Level]int64) error {
+	csvFile, err := os.Create(fmt.Sprintf("depth-%s.csv", end.Format("2006-01-02-15-04")))
+	if err != nil {
+		return fmt.Errorf("failed creating file: %w", err)
+	}
+	defer csvFile.Close()
+
+	for marketID, prices := range depth {
+		csvWriter := csv.NewWriter(csvFile)
+		sprices := maps.Keys(prices)
+		sort.Slice(sprices, func(i, j int) bool { return sprices[j].price.Lt(&sprices[i].price) })
+		for _, level := range sprices {
+			vol := prices[level]
+			record := []string{
+				end.Format(time.RFC3339),
+				marketID.String(),
+				level.side.String(),
+				level.price.Dec(),
+				strconv.FormatInt(vol, 10),
+			}
+			if err := csvWriter.Write(record); err != nil {
+				return fmt.Errorf("failed to write to file: %w", err)
+			}
+		}
+		csvWriter.Flush()
+	}
+	return nil
+}
+
+func writeLiveOrders(end time.Time, liveOrders map[entities.OrderID]Order) error {
+	csvFile, err := os.Create(fmt.Sprintf("liveorders-%s.csv", end.Format("2006-01-02-15-04")))
+	if err != nil {
+		return fmt.Errorf("failed creating file: %w", err)
+	}
+	defer csvFile.Close()
+	csvWriter := csv.NewWriter(csvFile)
+
+	for _, order := range liveOrders {
+		record := []string{
+			end.Format(time.RFC3339),
+			order.MarketID.String(),
+			order.PartyID.String(),
+			order.ID.String(),
+			order.Side.String(),
+			order.Price.Dec(),
+			strconv.FormatInt(order.Remaining, 10),
+		}
+
+		if err := csvWriter.Write(record); err != nil {
+			return fmt.Errorf("failed to write to file: %w", err)
+		}
+	}
+	csvWriter.Flush()
+
+	return nil
 }
 
 func doBucket(ctx context.Context, conn *pgx.Conn, start time.Time, end time.Time, liveOrders map[entities.OrderID]Order) error {
 	query := `
-	   select o.id, o.market_id, o.side, o.price, o.remaining, o.time_in_force, o.type, o.status
+	   select o.id, o.market_id, o.party_id, o.side, o.price, o.remaining, o.time_in_force, o.type, o.status
 	     from orders o
 	    where vega_time >= $1 and vega_time < $2
 	 order by vega_time, seq_num`
@@ -61,7 +109,7 @@ func doBucket(ctx context.Context, conn *pgx.Conn, start time.Time, end time.Tim
 	orders := []Order{}
 	err := pgxscan.Select(ctx, conn, &orders, query, start, end)
 	if err != nil {
-		log.Fatal("failed to query orders", logging.Error(err))
+		return fmt.Errorf("failed to query orders", err)
 	}
 
 	for _, order := range orders {
@@ -72,39 +120,23 @@ func doBucket(ctx context.Context, conn *pgx.Conn, start time.Time, end time.Tim
 		}
 	}
 
-	volume := map[entities.MarketID]map[Level]int64{}
+	depth := map[entities.MarketID]map[Level]int64{}
 	for _, order := range liveOrders {
-		if _, ok := volume[order.MarketID]; !ok {
-			volume[order.MarketID] = map[Level]int64{}
+		if _, ok := depth[order.MarketID]; !ok {
+			depth[order.MarketID] = map[Level]int64{}
 		}
 		lev := Level{price: order.Price, side: order.Side}
-		volume[order.MarketID][lev] += order.Remaining
+		depth[order.MarketID][lev] += order.Remaining
 	}
 
-	for marketID, prices := range volume {
-		csvFile, err := os.Create(fmt.Sprintf("depth-%s-%s.csv", marketID, end.Format("2006-01-02-15-04")))
-		if err != nil {
-			log.Fatal("failed creating file: %s", logging.Error(err))
-		}
-		defer csvFile.Close()
-		csvWriter := csv.NewWriter(csvFile)
-
-		// todo side
-		sprices := maps.Keys(prices)
-		sort.Slice(sprices, func(i, j int) bool { return sprices[j].price.LessThan(sprices[i].price) })
-		for _, level := range sprices {
-			vol := prices[level]
-			record := []string{
-				marketID.String(),
-				end.Format(time.RFC3339),
-				level.side.String(),
-				level.price.String(),
-				strconv.FormatInt(vol, 10),
-			}
-			csvWriter.Write(record)
-		}
-		csvWriter.Flush()
+	if err := writeDepth(end, depth); err != nil {
+		return fmt.Errorf("failed to write depth csv: %w", err)
 	}
+
+	if err := writeLiveOrders(end, liveOrders); err != nil {
+		return fmt.Errorf("failed to write live orders csv: %w", err)
+	}
+
 	fmt.Printf("bucket ending %s, orders in bucket: %d, live orders at end: %d\n",
 		end,
 		len(orders),
